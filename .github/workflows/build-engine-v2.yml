@@ -1,0 +1,91 @@
+name: Build MESS CHESS engine v2
+
+# Compiles MAME for the web (WebAssembly) with every chess-computer driver in it.
+# Run it from the Actions tab: "Build MESS CHESS engine" -> "Run workflow".
+# v2: Lua can catch its own errors and pause (needed for the auto-move add-on).
+# The result is the "messchess-engine" download (messchess.js + messchess.wasm) for MESS_CHESS_MAKER.html.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mame_version:
+        description: "MAME version (git tag)"
+        default: "mame0289"
+      emsdk_version:
+        description: "Emscripten version"
+        default: "6.0.4"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Get Emscripten
+        run: |
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git "$HOME/emsdk"
+          cd "$HOME/emsdk"
+          ./emsdk install "${{ inputs.emsdk_version }}"
+          ./emsdk activate "${{ inputs.emsdk_version }}"
+          source ./emsdk_env.sh
+          emcc --version | head -1
+          embuilder build sdl3 sdl3_ttf
+
+      - name: Get the MAME source
+        run: git clone --depth 1 --branch "${{ inputs.mame_version }}" https://github.com/mamedev/mame.git mame
+
+      - name: Let Lua catch its own errors (needed for the auto-move add-on)
+        working-directory: mame
+        run: |
+          # MAME's browser build only lets a few named functions catch C++ exceptions. MAME compiles Lua as C++,
+          # so Lua's own error and coroutine handling (luaD_rawrunprotected) must be on that list too.
+          sed -i "s|'_ZN15running_machine17start_all_devicesEv'|'_Z20luaD_rawrunprotectedP9lua_StatePFvS0_PvES1_','_ZN15running_machine17start_all_devicesEv'|g" scripts/genie.lua
+          grep -c "luaD_rawrunprotected" scripts/genie.lua
+
+      - name: Pick the chess-computer drivers
+        working-directory: mame
+        run: |
+          # whole folders of chess-computer makers, plus chess machines filed elsewhere
+          FOLDERS="fidelity novag saitek hegenerglaser newcrest chess chessking excalibur yeno appliedconcepts tryom"
+          FILES="commodore/chessmate.cpp ddr/chessmst.cpp ddr/chessmstdm.cpp ddr/lc80.cpp ddr/poly880.cpp ddr/sc2.cpp ddr/slc1.cpp
+                 elektor/avrmax.cpp handheld/chessking.cpp handheld/hh_hmcs40.cpp handheld/hh_pps41.cpp mattel/chess.cpp
+                 miltonbradley/grandmaster.cpp miltonbradley/milton.cpp ussr/debut.cpp ussr/im01.cpp ussr/intellect02.cpp"
+          L=""
+          for d in $FOLDERS; do
+            if [ -d "src/mame/$d" ]; then for f in src/mame/$d/*.cpp; do L="$L,$f"; done; fi
+          done
+          for f in $FILES; do
+            if [ -f "src/mame/$f" ]; then L="$L,src/mame/$f"; else echo "not in this MAME version: $f"; fi
+          done
+          L="${L#,}"
+          echo "SOURCES=$L" >> "$GITHUB_ENV"
+          echo "$L" | tr ',' '\n'
+          echo "$(echo "$L" | tr ',' '\n' | wc -l) driver files"
+
+      - name: Compile MAME (about 1-2 hours)
+        working-directory: mame
+        run: |
+          source "$HOME/emsdk/emsdk_env.sh"
+          emmake make SUBTARGET=messchess SOURCES="$SOURCES" REGENIE=1 NOWERROR=1 OPTIMIZE=3 \
+            PYTHON_EXECUTABLE=python3 LDOPTS="-sEXPORTED_RUNTIME_METHODS=cwrap,FS" -j"$(nproc)" 2>&1 | tee ../build-log.txt
+
+      - name: Package the engine
+        run: |
+          mkdir engine
+          W="$(ls -t mame/*.wasm | head -1)"
+          cp "$W" "${W%.wasm}.js" engine/
+          echo "${{ inputs.mame_version }} / emscripten ${{ inputs.emsdk_version }} / v2 (Lua exceptions)" > engine/version.txt
+          ls -la engine
+
+      - name: Save the engine
+        uses: actions/upload-artifact@v4
+        with:
+          name: messchess-engine
+          path: engine/
+
+      - name: Save the build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build-log.txt
+          if-no-files-found: ignore
